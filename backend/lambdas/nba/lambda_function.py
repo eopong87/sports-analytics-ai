@@ -19,13 +19,19 @@ def get_api_keys():
     return json.loads(secret['SecretString'])
 
 def get_live_scores(api_key):
-    """
-    Fetch live NBA scores from SportsRadar API
-    This runs every 60 seconds via EventBridge trigger
-    """
-    url = f"https://api.sportradar.com/nba/trial/v8/en/games/today/schedule.json?api_key={api_key}"
+    today = datetime.utcnow()
+    year = today.strftime('%Y')
+    month = today.strftime('%m')
+    day = today.strftime('%d')
     
-    response = requests.get(url, timeout=10)
+    url = f"https://api.sportradar.com/nba/trial/v8/en/games/{year}/{month}/{day}/schedule.json"
+    
+    headers = {
+        "accept": "application/json",
+        "x-api-key": api_key
+    }
+    
+    response = requests.get(url, headers=headers, timeout=10)
     response.raise_for_status()
     return response.json()
 
