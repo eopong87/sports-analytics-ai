@@ -1,0 +1,16 @@
+name: Deploy Sports Analytics
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Placeholder
+        run: echo "CI/CD pipeline coming in Phase 6!"
