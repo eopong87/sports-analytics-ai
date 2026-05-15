@@ -27,4 +27,7 @@ dist/
 .DS_Store
 
 # VS Code
-.vscode/
+.vscode/backend/lambdas/**/function.zip
+backend/lambdas/**/__pycache__
+frontend/node_modules
+*.zip

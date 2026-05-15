@@ -1,217 +1,122 @@
 import json
 import boto3
-import anthropic
-import sys
-import os
+import requests
+import logging
 from datetime import datetime
 
-# Import our shared utilities
-sys.path.append('/var/task')
-from shared.utils import (
-    get_api_keys,
-    get_from_dynamodb,
-    save_to_dynamodb,
-    send_to_kinesis,
-    format_response,
-    log_execution,
-    logger
-)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+dynamodb = boto3.resource('dynamodb')
+kinesis = boto3.client('kinesis')
+
+import os
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
+def save_to_dynamodb(table_name, item):
+    table = dynamodb.Table(table_name)
+    item['updatedAt'] = datetime.utcnow().isoformat()
+    table.put_item(Item=item)
+
+def send_to_kinesis(stream_name, data, partition_key):
+    try:
+        kinesis.put_record(StreamName=stream_name, Data=json.dumps(data), PartitionKey=partition_key)
+    except Exception as e:
+        logger.error(f"Kinesis error: {str(e)}")
+
+def format_response(status_code, body):
+    return {
+        'statusCode': status_code,
+        'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+        'body': json.dumps(body)
+    }
 
 def get_todays_games():
-    """
-    Fetch all of today's games from DynamoDB
-    These were saved by our NBA/NFL/MLB fetcher Lambdas
-    """
-    dynamodb = boto3.resource('dynamodb')
     table = dynamodb.Table('sports-analytics-live-games')
-    
-    # Scan for all games updated today
-    response = table.scan()
-    games = response.get('Items', [])
-    logger.info(f"Found {len(games)} games for analysis")
-    return games
+    return table.scan().get('Items', [])
 
-def get_player_stats_for_game(game_id):
-    """
-    Fetch all player stats for a specific game
-    """
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('sports-analytics-player-stats')
-    
-    response = table.query(
-        KeyConditionExpression='gameId = :gid',
-        ExpressionAttributeValues={':gid': game_id}
-    )
-    return response.get('Items', [])
+def get_todays_odds():
+    table = dynamodb.Table('sports-analytics-betting-odds')
+    return table.scan().get('Items', [])
 
-def build_nba_prompt(games, player_stats):
-    """
-    Build the prompt we send to Claude
-    The quality of this prompt determines the quality of insights
-    This is what AI Engineers get paid to do!
-    """
+def build_prompt(games, odds):
     games_summary = []
-    for game in games:
-        if game.get('sport') == 'NBA':
-            games_summary.append(
-                f"{game['awayTeam']} {game['awayScore']} - "
-                f"{game['homeTeam']} {game['homeScore']} "
-                f"({game['status']}, Q{game.get('quarter', 'N/A')})"
-            )
-    
-    stats_summary = []
-    for player in player_stats[:10]:  # Top 10 players
-        stats_summary.append(
-            f"{player['name']} ({player['team']}): "
-            f"{player['points']}pts, {player['rebounds']}reb, "
-            f"{player['assists']}ast"
+    for game in games[:20]:
+        games_summary.append(
+            f"{game.get('sport','?')} - {game.get('awayTeam','')} vs {game.get('homeTeam','')} | "
+            f"Score: {game.get('awayScore',0)}-{game.get('homeScore',0)} | Status: {game.get('status','')}"
         )
+    odds_summary = []
+    for odd in odds[:5]:
+        odds_summary.append(f"{odd.get('sport','')} - {odd.get('awayTeam','')} vs {odd.get('homeTeam','')}")
 
-    prompt = f"""You are an expert NBA analyst. Analyze the following live game data 
-and provide insights in a clear, engaging way.
+    return f"""You are an expert sports analyst covering NBA, NFL, and MLB.
 
-TODAY'S NBA GAMES:
+TODAY'S GAMES ({len(games_summary)} total):
 {chr(10).join(games_summary) if games_summary else 'No games today'}
 
-TOP PERFORMER STATS:
-{chr(10).join(stats_summary) if stats_summary else 'No stats available'}
+BETTING LINES:
+{chr(10).join(odds_summary) if odds_summary else 'No odds available'}
 
-Please provide:
-1. GAME INSIGHTS (2-3 sentences per active game)
-   - Current momentum and key storylines
-   - Standout performances
+Provide:
+1. GAME INSIGHTS - key storylines and performances
+2. BETTING PICKS - top 3 with confidence (Low/Medium/High)
+3. KEY TAKEAWAYS - 3 most important things today
 
-2. PLAYER TRENDS (top 3 performers)
-   - Who is hot and why
-   - Any surprising performances
+Be concise and actionable."""
 
-3. BETTING INSIGHTS (3 recommendations)
-   - Over/under recommendations based on current pace
-   - Player prop recommendations
-   - Confidence level for each (Low/Medium/High)
-
-4. KEY TAKEAWAYS (2-3 bullet points)
-   - Most important things happening in NBA today
-
-Keep the tone conversational and engaging.
-Format each section clearly with the headers above.
-Base all insights strictly on the data provided."""
-
-    return prompt
-
-def analyze_with_claude(prompt, api_key):
-    """
-    Send data to Claude and get back AI insights
-    This is the core AI integration
-    """
-    client = anthropic.Anthropic(api_key=api_key)
-    
-    logger.info("Sending data to Claude for analysis...")
-    
-    message = client.messages.create(
-        model="claude-opus-4-20250514",
-        max_tokens=1500,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-    
-    insights = message.content[0].text
-    logger.info("Claude analysis complete")
-    return insights
-
-def save_insights_to_dynamodb(sport, insights):
-    """
-    Save Claude's analysis back to DynamoDB
-    Frontend reads from here to display AI insights
-    """
-    item = {
-        'sport': sport,
-        'timestamp': datetime.utcnow().isoformat(),
-        'insights': insights,
-        'generatedBy': 'claude-opus-4',
-        'date': datetime.utcnow().strftime('%Y-%m-%d')
+def analyze_with_groq(prompt):
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Content-Type': 'application/json'
     }
-    
-    save_to_dynamodb('sports-analytics-ai-insights', item)
-    logger.info(f"Saved {sport} insights to DynamoDB")
-    return item
+    payload = {
+        'model': 'llama-3.3-70b-versatile',
+        'messages': [{'role': 'user', 'content': prompt}],
+        'max_tokens': 1000,
+        'temperature': 0.7
+    }
+    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()['choices'][0]['message']['content']
 
 def lambda_handler(event, context):
-    """
-    Main Lambda entry point
-    Triggered every 5 minutes by EventBridge
-    Reads all sports data and generates AI insights
-    """
-    start_time = datetime.utcnow()
-    logger.info(f"AI Analysis Engine started at {start_time.isoformat()}")
-    
+    logger.info("AI Analysis started")
     try:
-        # Step 1 — Get API keys
-        logger.info("Fetching API keys...")
-        keys = get_api_keys()
-        anthropic_key = keys['anthropic_api_key']
-        
-        # Step 2 — Get today's games from DynamoDB
-        logger.info("Fetching today's games...")
         games = get_todays_games()
-        
+        odds = get_todays_odds()
+        logger.info(f"Found {len(games)} games, {len(odds)} odds")
+
         if not games:
-            logger.info("No games found today — skipping analysis")
             return format_response(200, {
-                'message': 'No games to analyze today',
+                'message': 'No games to analyze',
                 'timestamp': datetime.utcnow().isoformat()
             })
-        
-        # Step 3 — Get player stats for each game
-        logger.info("Fetching player stats...")
-        all_player_stats = []
-        for game in games:
-            stats = get_player_stats_for_game(game['gameId'])
-            all_player_stats.extend(stats)
-        
-        logger.info(f"Retrieved stats for {len(all_player_stats)} players")
-        
-        # Step 4 — Build prompt and analyze with Claude
-        logger.info("Building AI prompt...")
-        nba_prompt = build_nba_prompt(games, all_player_stats)
-        
-        logger.info("Analyzing with Claude AI...")
-        nba_insights = analyze_with_claude(nba_prompt, anthropic_key)
-        
-        # Step 5 — Save insights to DynamoDB
-        logger.info("Saving insights to DynamoDB...")
-        saved_insights = save_insights_to_dynamodb('NBA', nba_insights)
-        
-        # Step 6 — Send to Kinesis for real-time frontend updates
-        send_to_kinesis(
-            'sports-analytics-live-stream',
-            {
-                'type': 'AI_INSIGHTS',
-                'sport': 'NBA',
-                'insights': nba_insights,
-                'timestamp': datetime.utcnow().isoformat()
-            },
-            'NBA-insights'
-        )
-        
-        # Step 7 — Log execution stats
-        log_execution('ai-analysis', start_time, len(games))
-        
+
+        prompt = build_prompt(games, odds)
+        insights = analyze_with_groq(prompt)
+        logger.info("Groq/Llama analysis complete")
+
+        save_to_dynamodb('sports-analytics-ai-insights', {
+            'sport': 'ALL',
+            'timestamp': datetime.utcnow().isoformat(),
+            'insights': insights,
+            'gamesAnalyzed': len(games),
+            'date': datetime.utcnow().strftime('%Y-%m-%d')
+        })
+
+        send_to_kinesis('sports-analytics-live-stream',
+            {'type': 'AI_INSIGHTS', 'insights': insights, 'timestamp': datetime.utcnow().isoformat()},
+            'ai-insights')
+
         return format_response(200, {
             'message': 'AI analysis complete',
             'gamesAnalyzed': len(games),
-            'playersAnalyzed': len(all_player_stats),
-            'insights': nba_insights,
+            'insights': insights,
             'timestamp': datetime.utcnow().isoformat()
         })
-        
+
     except Exception as e:
         logger.error(f"AI Analysis failed: {str(e)}")
-        return format_response(500, {
-            'error': str(e),
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        return format_response(500, {'error': str(e), 'timestamp': datetime.utcnow().isoformat()})
